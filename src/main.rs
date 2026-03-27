@@ -1,3 +1,5 @@
+mod second_file;
+
 fn main() {
-    println!("Hello, world!");
+    second_file::read_event();
 }
