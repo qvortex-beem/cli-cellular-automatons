@@ -1,3 +1,6 @@
+mod control;
+
 fn main() {
-    println!("Hello, world!");
+    control::control_simulation();
+    //  second_file::testing_read_event();
 }
