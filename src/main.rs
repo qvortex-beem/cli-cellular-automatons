@@ -1,5 +1,6 @@
-mod second_file;
+mod control;
 
 fn main() {
-    second_file::read_event();
+    control::control_simulation();
+    //  second_file::testing_read_event();
 }
