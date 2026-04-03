@@ -1,8 +1,10 @@
+use crate::camera::{self, Camera};
 use crate::move_n_print;
 
 use crossterm::{
     cursor::MoveTo,
-    execute,
+    execute, queue,
+    style::Print,
     terminal::{Clear, ClearType},
 };
 use std::{
@@ -14,7 +16,7 @@ use std::{
     default,
 };
 
-const CHUNK_SIZE: i64 = 16;
+const CHUNK_SIZE: i64 = 4;
 const SURVIVAL: usize = 2;
 const BIRTH: usize = 3;
 
@@ -156,25 +158,54 @@ impl World {
         self.chunks = new_chunks;
     }
 
-    pub fn draw(&mut self, out: &mut Stdout) {
-        execute!(
-            out,
-            Clear(ClearType::Purge),
-            Clear(ClearType::All),
-            MoveTo(0, 0)
-        );
-        for chunk in self.chunks.values() {
-            for (cord, cell) in chunk {
-                // if *cell == Cell::Alive {
-                //     move_n_print(out, cord.x as u16, cord.y as u16, '#');
-                // }
-                move_n_print(out, cord.x as u16, cord.y as u16, '#');
+    pub fn draw(&mut self, out: &mut Stdout, mut cam: Camera) {
+        queue!(out, Clear(ClearType::All), MoveTo(0, 0));
+        let left = cam.pos_x;
+        let right = cam.pos_x + cam.term_width as i64;
+        let top = cam.pos_y;
+        let bottom = cam.pos_y + cam.term_height as i64;
+
+        let chunk_left = left / CHUNK_SIZE;
+        let chunk_right = right / CHUNK_SIZE;
+        let chunk_top = top / CHUNK_SIZE;
+        let chunk_bottom = bottom / CHUNK_SIZE;
+        for x in chunk_left..=chunk_right {
+            for y in chunk_top..=chunk_bottom {
+                match self.chunks.get(&ChunkCord {
+                    chunk_x: x,
+                    chunk_y: y,
+                }) {
+                    Some(chunk) => {
+                        for (cord, _) in chunk {
+                            if (cord.x >= left && cord.x < right)
+                                && (cord.y >= top && cord.y < bottom)
+                            {
+                                let (screen_x, screen_y) = cam.world_to_screen(cord.x, cord.y);
+                                queue!(out, MoveTo(screen_x, screen_y), Print('#'));
+                                out.flush();
+                            }
+                        }
+                    }
+                    _ => (),
+                }
             }
         }
+
         out.flush();
     }
 
-    pub fn debug(&mut self) {
-        print!("{:?}", self.chunks);
+    pub fn lazy_draw(&mut self, out: &mut Stdout, mut cam: Camera, x: i64, y: i64, to_alive: bool) {
+        let chunk_cords = self.get_chunk_cords(Cord { x, y });
+        let chunk = self.chunks.entry(chunk_cords).or_insert_with(HashMap::new);
+        let (nx, ny) = cam.world_to_screen(x, y);
+        if !to_alive {
+            chunk.remove(&Cord { x, y });
+            queue!(out, MoveTo(nx, ny), Print(' ')).unwrap();
+            out.flush();
+        } else {
+            chunk.insert(Cord { x, y }, Cell::Alive);
+            queue!(out, MoveTo(nx, ny), Print('#')).unwrap();
+            out.flush();
+        }
     }
 }
