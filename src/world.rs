@@ -1,24 +1,20 @@
 use crate::camera::{self, Camera};
-use crate::move_n_print;
 
 use crossterm::{
     cursor::MoveTo,
-    execute, queue,
+    queue,
     style::Print,
     terminal::{Clear, ClearType},
 };
+use std::collections::HashMap;
 use std::{
     collections::HashSet,
     io::{self, Stdout, Write},
 };
-use std::{
-    collections::{HashMap, hash_map::Iter},
-    default,
-};
 
-const CHUNK_SIZE: i64 = 4;
-const SURVIVAL: usize = 2;
-const BIRTH: usize = 3;
+const CHUNK_SIZE: i64 = 32;
+const SURVIVAL: usize = 4;
+const BIRTH: usize = 2;
 
 #[derive(Eq, Hash, PartialEq, Clone, Copy, Debug)]
 pub struct Cord {
