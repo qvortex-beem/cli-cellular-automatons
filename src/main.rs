@@ -1,24 +1,39 @@
-use crossterm::event;
 use crossterm::event::{Event, KeyCode, KeyEventKind, read};
-use ratatui::layout::Alignment;
-use ratatui::widgets::Wrap;
 use ratatui::{
     DefaultTerminal, Frame, TerminalOptions,
-    layout::{self, Constraint, Direction, Layout, Rect},
+    layout::{self, Alignment, Constraint, Direction, Layout, Rect},
+    macros::ratatui_core::widgets,
     style::{Color, Style, Stylize},
     symbols::block,
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, List, ListDirection, ListItem, ListState, Paragraph, Wrap,
+    },
 };
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::error::Error;
-use std::io::{self, Stdout};
-use std::path;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::Duration;
-use std::{fs, vec};
+use serde::{Deserialize, Serialize};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    fs,
+    io::{self, Stdout},
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::Duration,
+    vec,
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SettingsRecord {
+    action_id: String,
+    key_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SimulationRecord {
+    cells_to_alive: usize,
+    cells_to_birth: usize,
+    simulation_speed: usize,
+}
 
 trait Component {
     fn render(
@@ -30,19 +45,22 @@ trait Component {
         has_focused_parent: bool,
         app_state: Rc<RefCell<AppState>>,
     );
-    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>);
+    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) -> Feedback;
     fn get_child(&mut self, index: usize) -> Option<&mut Box<dyn Component>>;
     fn get_children_count(&mut self) -> usize;
-    fn get_component_type(&self) -> Component_type;
+    fn can_be_in_focus(&self) -> Ability_to_focus;
     fn get_focusable_indexes(&mut self) -> Vec<usize>;
 }
 
+enum Feedback {
+    Esc,
+    None,
+}
+
 #[derive(PartialEq)]
-enum Component_type {
-    Container,
-    Label,
-    Input,
-    Button,
+enum Ability_to_focus {
+    Can_be_in_focus,
+    Cant_be_in_focus,
 }
 
 enum ScreenState {
@@ -52,8 +70,9 @@ enum ScreenState {
 
 struct AppState {
     screen: ScreenState,
-    simulations_settings: HashMap<String, usize>,
+    simulations_settings: HashMap<String, usize>, // настройка симуляции -> ее значение
     error_message: String,
+    key_bindings: HashMap<String, String>, // действие -> каноническое имя
 }
 impl AppState {
     fn new() -> Self {
@@ -61,14 +80,154 @@ impl AppState {
             screen: ScreenState::Settings,
             simulations_settings: HashMap::new(),
             error_message: String::new(),
+            key_bindings: HashMap::new(),
         };
-        x.simulations_settings
-            .insert("cells_to_alive".to_string(), 1);
-        x.simulations_settings
-            .insert("cells_to_birth".to_string(), 3);
-        x.simulations_settings
-            .insert("simulation_speed".to_string(), 1);
+        let _ = x.load_last_saves();
         x
+    }
+    fn default_data_dir() -> PathBuf {
+        let exe_path = std::env::current_exe().unwrap_or(PathBuf::from("."));
+        let exe_dir = exe_path.parent().unwrap_or(&exe_path);
+        exe_dir.join("saves")
+    }
+
+    fn default_settings_path() -> PathBuf {
+        Self::default_data_dir().join("settings.csv")
+    }
+
+    fn default_simulation_path() -> PathBuf {
+        Self::default_data_dir().join("simulation.csv")
+    }
+    fn load_last_saves(&mut self) -> std::io::Result<()> {
+        let last_saves_path = Self::default_data_dir().join("last_saves.csv");
+        if !last_saves_path.exists() {
+            // Создаём дефолтные файлы
+            self.create_default_files()?;
+            return Ok(());
+        }
+
+        let mut reader = csv::Reader::from_path(&last_saves_path)?;
+        let mut records = reader.records();
+        if let Some(Ok(record)) = records.next() {
+            let settings_path = PathBuf::from(&record[0]);
+            let sim_path = PathBuf::from(&record[1]);
+            self.load_settings_from_file(&settings_path)?;
+            self.load_simulation_from_file(&sim_path)?;
+        }
+        Ok(())
+    }
+    fn create_default_files(&mut self) -> std::io::Result<()> {
+        let data_dir = Self::default_data_dir();
+        std::fs::create_dir_all(&data_dir)?;
+        let settings_path = Self::default_settings_path();
+        let sim_path = Self::default_simulation_path();
+
+        if !settings_path.exists() {
+            self.key_bindings
+                .insert("pause".to_string(), "Space".to_string());
+            self.key_bindings
+                .insert("right".to_string(), "Right".to_string());
+            self.key_bindings
+                .insert("left".to_string(), "Left".to_string());
+            self.key_bindings.insert("up".to_string(), "Up".to_string());
+            self.key_bindings
+                .insert("down".to_string(), "Down".to_string());
+            self.key_bindings
+                .insert("zoom_in".to_string(), "+".to_string());
+            self.key_bindings
+                .insert("zoom_out".to_string(), "-".to_string());
+            self.key_bindings
+                .insert("speed_up".to_string(), "L".to_string());
+            self.key_bindings
+                .insert("speed_down".to_string(), "J".to_string());
+            self.key_bindings
+                .insert("step".to_string(), "T".to_string());
+            self.key_bindings
+                .insert("to_settings".to_string(), "Esc".to_string());
+            self.save_settings_to_file(&settings_path)?;
+        }
+        if !sim_path.exists() {
+            self.simulations_settings
+                .insert("cells_to_alive".to_string(), 1);
+            self.simulations_settings
+                .insert("cells_to_birth".to_string(), 3);
+            self.simulations_settings
+                .insert("simulation_speed".to_string(), 1);
+            self.save_simulation_to_file(&sim_path)?;
+        }
+
+        let mut writer = csv::Writer::from_path(data_dir.join("last_saves.csv"))?;
+        writer.write_record(&[settings_path.to_str().unwrap(), sim_path.to_str().unwrap()])?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn load_settings_from_file(&mut self, path: &Path) -> std::io::Result<()> {
+        let mut reader = csv::Reader::from_path(path)?;
+        for result in reader.deserialize() {
+            let record: SettingsRecord =
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.key_bindings.insert(record.action_id, record.key_name);
+        }
+        Ok(())
+    }
+    fn load_simulation_from_file(&mut self, path: &Path) -> std::io::Result<()> {
+        let mut reader = csv::Reader::from_path(path)?;
+        if let Some(result) = reader.deserialize().next() {
+            let record: SimulationRecord =
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            self.simulations_settings
+                .insert("cells_to_alive".to_string(), record.cells_to_alive);
+            self.simulations_settings
+                .insert("cells_to_birth".to_string(), record.cells_to_birth);
+            self.simulations_settings
+                .insert("simulation_speed".to_string(), record.simulation_speed);
+        }
+        Ok(())
+    }
+    fn save_settings_to_file(&self, path: &Path) -> std::io::Result<()> {
+        let mut writer = csv::Writer::from_path(path)?;
+        for (action_id, key_name) in &self.key_bindings {
+            writer.serialize(SettingsRecord {
+                action_id: action_id.clone(),
+                key_name: key_name.clone(),
+            })?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+    fn save_simulation_to_file(&self, path: &Path) -> std::io::Result<()> {
+        let cells_to_alive = *self
+            .simulations_settings
+            .get("cells_to_alive")
+            .unwrap_or(&1);
+        let cells_to_birth = *self
+            .simulations_settings
+            .get("cells_to_birth")
+            .unwrap_or(&3);
+        let simulation_speed = *self
+            .simulations_settings
+            .get("simulation_speed")
+            .unwrap_or(&1);
+        let record = SimulationRecord {
+            cells_to_alive,
+            cells_to_birth,
+            simulation_speed,
+        };
+        let mut writer = csv::Writer::from_path(path)?;
+        writer.serialize(record)?;
+        writer.flush()?;
+        Ok(())
+    }
+    fn update_last_saves(settings_path: &Path, simulation_path: &Path) -> std::io::Result<()> {
+        let last_saves_path = Self::default_data_dir().join("last_saves.csv");
+        let mut writer = csv::Writer::from_path(last_saves_path)?;
+        writer.write_record(&[
+            settings_path.to_str().unwrap(),
+            simulation_path.to_str().unwrap(),
+        ])?;
+        writer.flush()?;
+        Ok(())
     }
 }
 
@@ -85,16 +244,27 @@ impl App {
                 let focus_stack = self.focus_stack.clone();
                 let entered_component = self.get_entered_component(&focus_stack);
                 if let Some(component) = entered_component {
-                    component.handle_event(ev, app_state_rc.clone());
+                    match component.handle_event(ev, app_state_rc.clone()) {
+                        Feedback::Esc => {
+                            if self.focus_stack.len() > 2 {
+                                self.esc();
+                            }
+                        }
+                        Feedback::None => {}
+                    }
                 }
                 match key.code {
                     KeyCode::Left | KeyCode::Up => {
-                        let siblings_len = self.get_focus_siblings();
-                        self.move_focus(-1, siblings_len);
+                        if self.get_focus_siblings() > 1 {
+                            let siblings_len = self.get_focus_siblings();
+                            self.move_focus(-1, siblings_len);
+                        }
                     }
                     KeyCode::Down | KeyCode::Right => {
-                        let siblings_len = self.get_focus_siblings();
-                        self.move_focus(1, siblings_len);
+                        if self.get_focus_siblings() > 1 {
+                            let siblings_len = self.get_focus_siblings();
+                            self.move_focus(1, siblings_len);
+                        }
                     }
                     KeyCode::Enter => {
                         let focus_stack = self.focus_stack.clone();
@@ -105,7 +275,14 @@ impl App {
                                 let focus_stack = self.focus_stack.clone();
                                 let entered_component = self.get_entered_component(&focus_stack);
                                 if let Some(component) = entered_component {
-                                    component.handle_event(ev, app_state_rc.clone());
+                                    match component.handle_event(ev, app_state_rc.clone()) {
+                                        Feedback::Esc => {
+                                            if self.focus_stack.len() > 2 {
+                                                self.esc();
+                                            }
+                                        }
+                                        Feedback::None => {}
+                                    }
                                 }
                             }
                         }
@@ -226,14 +403,18 @@ impl App {
 struct Container {
     title: String,
     direction: Direction,
+    can_be_in_focus: bool,
     children: Vec<Box<dyn Component>>,
+    borders: bool,
 }
 impl Container {
     fn new() -> Self {
         Self {
             title: "".to_string(),
             direction: Direction::Horizontal,
+            can_be_in_focus: true,
             children: vec![],
+            borders: false,
         }
     }
     fn add_child(&mut self, child: Box<dyn Component>) {
@@ -241,7 +422,9 @@ impl Container {
     }
 }
 impl Component for Container {
-    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) {}
+    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) -> Feedback {
+        Feedback::None
+    }
     fn render(
         &self,
         frame: &mut Frame,
@@ -253,7 +436,13 @@ impl Component for Container {
     ) {
         let is_focused =
             !focus_stack.is_empty() && focus_stack[0] == focus_index && has_focused_parent;
-        let borders = Borders::ALL;
+        let borders = {
+            if self.borders {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            }
+        };
         let title = if is_focused {
             self.title.clone()
         } else {
@@ -305,26 +494,33 @@ impl Component for Container {
         self.children
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.get_component_type() != Component_type::Label)
+            .filter(|(_, c)| c.can_be_in_focus() != Ability_to_focus::Cant_be_in_focus)
             .map(|(i, _)| i)
             .collect()
     }
     fn get_children_count(&mut self) -> usize {
         self.children
             .iter()
-            .filter(|component| component.get_component_type() != Component_type::Label)
+            .filter(|component| component.can_be_in_focus() != Ability_to_focus::Cant_be_in_focus)
             .count()
     }
-    fn get_component_type(&self) -> Component_type {
-        Component_type::Container
+    fn can_be_in_focus(&self) -> Ability_to_focus {
+        if self.can_be_in_focus {
+            Ability_to_focus::Can_be_in_focus
+        } else {
+            Ability_to_focus::Cant_be_in_focus
+        }
     }
 }
 
 struct Label {
     text: String,
+    border: bool,
 }
 impl Component for Label {
-    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) {}
+    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) -> Feedback {
+        Feedback::None
+    }
     fn render(
         &self,
         frame: &mut Frame,
@@ -334,7 +530,13 @@ impl Component for Label {
         has_focused_parent: bool,
         app_state: Rc<RefCell<AppState>>,
     ) {
-        let borders = Borders::ALL;
+        let borders = {
+            if self.border {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            }
+        };
         let container = Block::default()
             .borders(borders)
             .border_style(Style::default().fg(Color::DarkGray))
@@ -352,8 +554,8 @@ impl Component for Label {
     fn get_children_count(&mut self) -> usize {
         0
     }
-    fn get_component_type(&self) -> Component_type {
-        Component_type::Label
+    fn can_be_in_focus(&self) -> Ability_to_focus {
+        Ability_to_focus::Cant_be_in_focus
     }
     fn get_focusable_indexes(&mut self) -> Vec<usize> {
         vec![]
@@ -366,6 +568,7 @@ struct Input {
     value: String,
     cursor: usize,
     editing: bool,
+    border: bool,
 }
 impl Input {
     fn new(id: String, app_state: Rc<RefCell<AppState>>) -> Self {
@@ -383,6 +586,7 @@ impl Input {
             value: value.clone(),
             cursor: value.len(),
             editing: false,
+            border: true,
         };
         x
     }
@@ -426,10 +630,10 @@ impl Component for Input {
     fn get_children_count(&mut self) -> usize {
         1
     }
-    fn get_component_type(&self) -> Component_type {
-        Component_type::Input
+    fn can_be_in_focus(&self) -> Ability_to_focus {
+        Ability_to_focus::Can_be_in_focus
     }
-    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) {
+    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) -> Feedback {
         self.editing = true;
         if let Event::Key(key) = ev {
             if key.kind == KeyEventKind::Press {
@@ -458,6 +662,7 @@ impl Component for Input {
                 }
             }
         }
+        Feedback::None
     }
     fn render(
         &self,
@@ -471,7 +676,13 @@ impl Component for Input {
         let is_focused =
             !focus_stack.is_empty() && focus_stack[0] == focus_index && has_focused_parent;
         let is_entered = self.editing;
-        let borders = Borders::ALL;
+        let borders = {
+            if self.border {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            }
+        };
         let title = self.title.clone();
         let borders_style = {
             if is_focused && focus_stack.len() == 1 || is_entered {
@@ -528,6 +739,177 @@ impl Component for Input {
     }
 }
 
+struct Button {
+    callback: Option<Box<dyn Fn(Rc<RefCell<AppState>>)>>,
+}
+impl Button {
+    fn new(callback: impl Fn(Rc<RefCell<AppState>>) + 'static) -> Self {
+        Self {
+            callback: Some(Box::new(callback)),
+        }
+    }
+}
+impl Component for Button {
+    fn get_child(&mut self, index: usize) -> Option<&mut Box<dyn Component>> {
+        None
+    }
+    fn get_children_count(&mut self) -> usize {
+        1
+    }
+    fn can_be_in_focus(&self) -> Ability_to_focus {
+        Ability_to_focus::Can_be_in_focus
+    }
+    fn get_focusable_indexes(&mut self) -> Vec<usize> {
+        vec![]
+    }
+    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) -> Feedback {
+        if let Event::Key(key) = ev {
+            if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
+                if let Some(call_back) = &self.callback {
+                    call_back(app_state);
+                }
+            }
+        }
+        Feedback::None
+    }
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        focus_stack: Vec<usize>,
+        focus_index: usize,
+        has_focused_parent: bool,
+        app_state: Rc<RefCell<AppState>>,
+    ) {
+        let is_focused =
+            !focus_stack.is_empty() && focus_stack[0] == focus_index && has_focused_parent;
+        let color = {
+            if is_focused {
+                Color::Black
+            } else {
+                Color::Black
+            }
+        };
+        let container = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White));
+        frame.render_widget(&container, area);
+        let inner_area = container.inner(area);
+        let inner = Block::default().style(Style::default().bg(color));
+        frame.render_widget(&inner, inner_area);
+    }
+}
+
+struct KeybindInput {
+    action_id: String, // "pause"
+    label: String,     // "пауза"
+    value: String,     // "Space"
+    editing: bool,
+}
+impl KeybindInput {
+    fn new(action_id: String, label: String, app_state: &Rc<RefCell<AppState>>) -> Self {
+        let x = Self {
+            action_id,
+            label,
+            value: "".to_string(),
+            editing: false,
+        };
+        x
+    }
+    fn current_binding(&self, app_state: &Rc<RefCell<AppState>>) -> String {
+        app_state
+            .borrow()
+            .key_bindings
+            .get(&self.action_id)
+            .cloned()
+            .unwrap_or_else(|| "?".to_string())
+    }
+    fn set_binding(&self, key_name: String, app_state: &Rc<RefCell<AppState>>) {
+        app_state
+            .borrow_mut()
+            .key_bindings
+            .insert(self.action_id.clone(), key_name);
+    }
+}
+impl Component for KeybindInput {
+    fn can_be_in_focus(&self) -> Ability_to_focus {
+        Ability_to_focus::Can_be_in_focus
+    }
+    fn get_child(&mut self, index: usize) -> Option<&mut Box<dyn Component>> {
+        None
+    }
+    fn get_children_count(&mut self) -> usize {
+        1
+    }
+    fn get_focusable_indexes(&mut self) -> Vec<usize> {
+        vec![]
+    }
+    fn render(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        focus_stack: Vec<usize>,
+        focus_index: usize,
+        has_focused_parent: bool,
+        app_state: Rc<RefCell<AppState>>,
+    ) {
+        let is_focused =
+            !focus_stack.is_empty() && focus_stack[0] == focus_index && has_focused_parent;
+        let is_editing = self.editing;
+        let borders = {
+            if is_focused || is_editing {
+                Borders::ALL
+            } else {
+                Borders::NONE
+            }
+        };
+        let border_style = if is_focused || is_editing {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Black)
+        };
+
+        let block = Block::default().borders(borders).border_style(border_style);
+        frame.render_widget(&block, area);
+        let inner = block.inner(area);
+
+        let value = if is_editing {
+            "press key".to_string()
+        } else {
+            self.current_binding(&app_state)
+        };
+        let layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Fill(1), Constraint::Fill(1)])
+            .split(inner);
+        let display_label = Paragraph::new(self.label.clone())
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true });
+        let display_value = Paragraph::new(value)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+        frame.render_widget(display_label, layout[0]);
+        frame.render_widget(display_value, layout[1]);
+    }
+    fn handle_event(&mut self, ev: &Event, app_state: Rc<RefCell<AppState>>) -> Feedback {
+        if let Event::Key(key) = ev {
+            if key.kind == KeyEventKind::Press {
+                if self.editing {
+                    let canonical = canonical_key_name(key.code, &app_state);
+                    self.set_binding(canonical.clone(), &app_state);
+                    self.editing = false;
+                    app_state.borrow_mut().error_message.clear();
+                    return Feedback::Esc;
+                } else {
+                    if key.code == KeyCode::Enter {
+                        self.editing = true;
+                    }
+                }
+            }
+        }
+        Feedback::None
+    }
+}
 fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
     ratatui::run(app)?;
@@ -545,15 +927,20 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                     let column1 = Container {
                         title: "мир".to_string(),
                         direction: Direction::Vertical,
+                        can_be_in_focus: true,
+                        borders: true,
                         children: vec![
                             {
                                 let cell_count = Container {
                                     title: "".to_string(),
                                     direction: Direction::Vertical,
+                                    can_be_in_focus: true,
+                                    borders: true,
                                     children: vec![
                                         {
                                             let label = Label {
                                                 text: "Количество клеток:".to_string(),
+                                                border: true,
                                             };
                                             Box::new(label)
                                         },
@@ -581,10 +968,13 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                                 let sim_speed = Container {
                                     title: "".to_string(),
                                     direction: Direction::Vertical,
+                                    can_be_in_focus: true,
+                                    borders: true,
                                     children: vec![
                                         {
                                             let label = Label {
                                                 text: "Скорость симуляции:".to_string(),
+                                                border: true,
                                             };
                                             Box::new(label)
                                         },
@@ -602,8 +992,131 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                             {
                                 let buttons = Container {
                                     title: "".to_string(),
-                                    direction: Direction::Vertical,
-                                    children: vec![],
+                                    direction: Direction::Horizontal,
+                                    can_be_in_focus: true,
+                                    borders: true,
+                                    children: vec![
+                                        {
+                                            let column1 = Container {
+                                                title: "".to_string(),
+                                                direction: Direction::Vertical,
+                                                can_be_in_focus: false,
+                                                borders: false,
+                                                children: vec![
+                                                    {
+                                                        let label = Label {
+                                                            text: "действие".to_string(),
+                                                            border: true,
+                                                        };
+                                                        Box::new(label)
+                                                    },
+                                                    {
+                                                        let label = Label {
+                                                            text: "сохранить".to_string(),
+                                                            border: true,
+                                                        };
+                                                        Box::new(label)
+                                                    },
+                                                    {
+                                                        let label = Label {
+                                                            text: "импорт".to_string(),
+                                                            border: true,
+                                                        };
+                                                        Box::new(label)
+                                                    },
+                                                    {
+                                                        let label = Label {
+                                                            text: "экспорт".to_string(),
+                                                            border: true,
+                                                        };
+                                                        Box::new(label)
+                                                    },
+                                                ],
+                                            };
+                                            Box::new(column1)
+                                        },
+                                        {
+                                            let column2 = Container {
+                                                title: "".to_string(),
+                                                direction: Direction::Vertical,
+                                                can_be_in_focus: true,
+                                                borders: true,
+                                                children: vec![
+                                                    {
+                                                        let label = Label {
+                                                            text: "настройки".to_string(),
+                                                            border: true,
+                                                        };
+                                                        Box::new(label)
+                                                    },
+                                                    {
+                                                        let button = Button::new(|state| {
+
+                                                        });
+                                                        Box::new(button)
+                                                    },
+                                                    {
+                                                        let button = Button::new(|state| {
+                                                            
+                                                        });
+                                                        Box::new(button)
+                                                    },
+                                                    {
+                                                        let button = Button::new(|state| {
+                                                            if let Some(path) = rfd::FileDialog::new()
+                                                                .set_title("Сохранить настройки клавиш")
+                                                                .add_filter("CSV", &["csv"])
+                                                                .save_file()
+                                                            {
+                                                                let _ = state.borrow().save_settings_to_file(&path);
+                                                                let sim_path = AppState::default_simulation_path(); 
+                                                                let _ = AppState::update_last_saves(&path, &sim_path);
+                                                                state.borrow_mut().error_message = format!("Сохранено в {}", path.display());
+                                                            }
+                                                        });
+                                                        Box::new(button)
+                                                    },
+                                                ],
+                                            };
+                                            Box::new(column2)
+                                        },
+                                        {
+                                            let column3 = Container {
+                                                title: "".to_string(),
+                                                direction: Direction::Vertical,
+                                                can_be_in_focus: true,
+                                                borders: true,
+                                                children: vec![
+                                                    {
+                                                        let label = Label {
+                                                            text: "симуляция".to_string(),
+                                                            border: true,
+                                                        };
+                                                        Box::new(label)
+                                                    },
+                                                    {
+                                                        let button = Button::new(|state| {
+                                                            
+                                                        });
+                                                        Box::new(button)
+                                                    },
+                                                    {
+                                                        let button = Button::new(|state| {
+                                                            
+                                                        });
+                                                        Box::new(button)
+                                                    },
+                                                    {
+                                                        let button = Button::new(|state| {
+                                                            
+                                                        });
+                                                        Box::new(button)
+                                                    },
+                                                ],
+                                            };
+                                            Box::new(column3)
+                                        },
+                                    ],
                                 };
                                 Box::new(buttons)
                             },
@@ -615,7 +1128,21 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                     let column2 = Container {
                         title: "".to_string(),
                         direction: Direction::Vertical,
-                        children: vec![],
+                        can_be_in_focus: true,
+                        borders: true,
+                        children: vec![
+                            Box::new(KeybindInput::new("pause".to_string(), "пауза".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("right".to_string(), "→".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("left".to_string(), "←".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("up".to_string(), "↑".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("down".to_string(), "↓".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("zoom_in".to_string(), "приблизить".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("zoom_out".to_string(), "отдалить".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("speed_up".to_string(), "ускорить".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("speed_down".to_string(), "замедлить".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("step".to_string(), "совершить одну итерацию".to_string(), &app_state)),
+                            Box::new(KeybindInput::new("to_settings".to_string(), "выход в настройки".to_string(), &app_state)),
+                        ],
                     };
                     Box::new(column2)
                 },
@@ -623,6 +1150,8 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                     let column3 = Container {
                         title: "".to_string(),
                         direction: Direction::Vertical,
+                        can_be_in_focus: true,
+                        borders: true,
                         children: vec![],
                     };
                     Box::new(column3)
@@ -659,4 +1188,89 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.render(frame, area);
+}
+
+// struct Button {
+//     callback: Option<Rc<dyn Fn(Rc<RefCell<AppState>>)>>
+// }
+// let save_button = Button {
+//     callback: Some(Rc::new(|state: Rc<RefCell<AppState>>| {
+//         // Логика сохранения
+//         let mut s = state.borrow_mut();
+//         s.error_message = "Настройки сохранены!".to_string();
+//     }))
+// };
+// Box::new(save_button)
+fn canonical_key_name(key: KeyCode, app_state: &Rc<RefCell<AppState>>) -> String {
+    match key {
+        KeyCode::Char(c) => {
+            let latin_upper = match c {
+                'а'..='я' | 'А'..='Я' | 'ё' | 'Ё' => match c.to_ascii_lowercase() {
+                    'й' => "Q",
+                    'ц' => "W",
+                    'у' => "E",
+                    'к' => "R",
+                    'е' => "T",
+                    'н' => "Y",
+                    'г' => "U",
+                    'ш' => "I",
+                    'щ' => "O",
+                    'з' => "P",
+                    'х' => "{",
+                    'ъ' => "}",
+                    'ф' => "A",
+                    'ы' => "S",
+                    'в' => "D",
+                    'а' => "F",
+                    'п' => "G",
+                    'р' => "H",
+                    'о' => "J",
+                    'л' => "K",
+                    'д' => "L",
+                    'ж' => ":",
+                    'э' => "\'",
+                    'я' => "Z",
+                    'ч' => "X",
+                    'с' => "C",
+                    'м' => "V",
+                    'и' => "B",
+                    'т' => "N",
+                    'ь' => "M",
+                    'б' => "<",
+                    'ю' => ">",
+                    '.' => "/",
+                    '\\' => "\\",
+                    ' ' => "Space",
+                    '_' => "-",
+                    '=' => "+",
+                    _ => &c.to_ascii_uppercase().to_string(),
+                },
+                '.' => "/",
+                    '\\' => "\\",
+                ' ' => "Space",
+                '_' => "-",
+                '=' => "+",
+                _ => &c.to_uppercase().to_string(),
+            };
+            latin_upper.to_string()
+        }
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Esc => "Esc".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PageUp".to_string(),
+        KeyCode::PageDown => "PageDown".to_string(),
+        KeyCode::Insert => "Insert".to_string(),
+        _ => {
+            app_state.borrow_mut().error_message = "Недопустимое значение".to_string();
+            "?".to_string()
+        }
+    }
 }

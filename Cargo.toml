@@ -6,5 +6,9 @@ edition = "2024"
 [dependencies]
 color-eyre = "0.6.5"
 crossterm = "0.29.0"
+csv = "1.4.0"
+dirs = "6.0.0"
 rand = "0.10.0"
 ratatui = "0.30.0"
+rfd = "0.17.2"
+serde = { version = "1.0.228", features = ["derive"] }
