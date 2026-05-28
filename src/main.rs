@@ -12,14 +12,7 @@ use ratatui::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
-    collections::HashMap,
-    fs,
-    io::{self, Stdout},
-    path::{Path, PathBuf},
-    rc::Rc,
-    time::Duration,
-    vec,
+    cell::RefCell, collections::HashMap, fmt::format, fs, io::{self, Stdout}, path::{Path, PathBuf}, rc::Rc, time::Duration, vec
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,33 +75,20 @@ impl AppState {
             error_message: String::new(),
             key_bindings: HashMap::new(),
         };
-        let _ = x.load_last_saves();
+        if let Err(e) = x.load_last_saves() {
+            x.error_message = format!("Ошибка загрузки: {}", e);
+        }
         x
     }
-    fn default_data_dir() -> PathBuf {
-        let exe_path = std::env::current_exe().unwrap_or(PathBuf::from("."));
-        let exe_dir = exe_path.parent().unwrap_or(&exe_path);
-        exe_dir.join("saves")
-    }
-
-    fn default_settings_path() -> PathBuf {
-        Self::default_data_dir().join("settings.csv")
-    }
-
-    fn default_simulation_path() -> PathBuf {
-        Self::default_data_dir().join("simulation.csv")
-    }
     fn load_last_saves(&mut self) -> std::io::Result<()> {
-        let last_saves_path = Self::default_data_dir().join("last_saves.csv");
-        if !last_saves_path.exists() {
-            // Создаём дефолтные файлы
+        let last_saves = last_saves_path();
+        if !&last_saves.exists() {
             self.create_default_files()?;
             return Ok(());
         }
 
-        let mut reader = csv::Reader::from_path(&last_saves_path)?;
-        let mut records = reader.records();
-        if let Some(Ok(record)) = records.next() {
+        let mut reader = csv::Reader::from_path(&last_saves)?;
+        if let Ok(record) = reader.headers() {
             let settings_path = PathBuf::from(&record[0]);
             let sim_path = PathBuf::from(&record[1]);
             self.load_settings_from_file(&settings_path)?;
@@ -117,51 +97,53 @@ impl AppState {
         Ok(())
     }
     fn create_default_files(&mut self) -> std::io::Result<()> {
-        let data_dir = Self::default_data_dir();
-        std::fs::create_dir_all(&data_dir)?;
-        let settings_path = Self::default_settings_path();
-        let sim_path = Self::default_simulation_path();
+        // Создаём все необходимые директории
+        std::fs::create_dir_all(default_settings_dir())?;
+        std::fs::create_dir_all(default_simulation_dir())?;
+
+        let settings_path = default_settings_path();
+        let sim_path = default_simulation_path();
 
         if !settings_path.exists() {
-            self.key_bindings
-                .insert("pause".to_string(), "Space".to_string());
-            self.key_bindings
-                .insert("right".to_string(), "Right".to_string());
-            self.key_bindings
-                .insert("left".to_string(), "Left".to_string());
-            self.key_bindings.insert("up".to_string(), "Up".to_string());
-            self.key_bindings
-                .insert("down".to_string(), "Down".to_string());
-            self.key_bindings
-                .insert("zoom_in".to_string(), "+".to_string());
-            self.key_bindings
-                .insert("zoom_out".to_string(), "-".to_string());
-            self.key_bindings
-                .insert("speed_up".to_string(), "L".to_string());
-            self.key_bindings
-                .insert("speed_down".to_string(), "J".to_string());
-            self.key_bindings
-                .insert("step".to_string(), "T".to_string());
-            self.key_bindings
-                .insert("to_settings".to_string(), "Esc".to_string());
+            self.key_bindings = default_key_bindings();
             self.save_settings_to_file(&settings_path)?;
-        }
-        if !sim_path.exists() {
-            self.simulations_settings
-                .insert("cells_to_alive".to_string(), 1);
-            self.simulations_settings
-                .insert("cells_to_birth".to_string(), 3);
-            self.simulations_settings
-                .insert("simulation_speed".to_string(), 1);
-            self.save_simulation_to_file(&sim_path)?;
+        } else {
+            self.load_settings_from_file(&settings_path)?;
         }
 
-        let mut writer = csv::Writer::from_path(data_dir.join("last_saves.csv"))?;
+        if !sim_path.exists() {
+            self.simulations_settings = default_simulation_settings();
+            self.save_simulation_to_file(&sim_path)?;
+        } else {
+            self.load_simulation_from_file(&sim_path)?;
+        }
+
+        // Обновляем last_saves.csv
+        let mut writer = csv::Writer::from_path(last_saves_path())?;
         writer.write_record(&[settings_path.to_str().unwrap(), sim_path.to_str().unwrap()])?;
         writer.flush()?;
         Ok(())
     }
-
+    fn save_current_settings(&self) -> std::io::Result<()> {
+        self.save_settings_to_file(&current_settings_path())?;
+        self.save_simulation_to_file(&current_simulation_path())?;
+        Ok(())
+    }
+    fn import_settings_from_file(&mut self, path: PathBuf) -> std::io::Result<()> {
+        let mut temp_bindings = HashMap::new();
+        let mut reader = csv::Reader::from_path(&path)?;
+        for result in reader.deserialize() {
+            let record: SettingsRecord = result.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            temp_bindings.insert(record.action_id, record.key_name);
+        }
+        let new_name = format!("imported_{}", path.file_name().unwrap().to_string_lossy());
+        let new_path = default_settings_dir().join(new_name);
+        AppState::update_last_saves(&new_path, &default_simulation_path())?;
+        std::fs::copy(&path, &new_path)?;
+        self.key_bindings = temp_bindings;
+        self.save_current_settings()?;
+        Ok(())
+    }
     fn load_settings_from_file(&mut self, path: &Path) -> std::io::Result<()> {
         let mut reader = csv::Reader::from_path(path)?;
         for result in reader.deserialize() {
@@ -220,12 +202,8 @@ impl AppState {
         Ok(())
     }
     fn update_last_saves(settings_path: &Path, simulation_path: &Path) -> std::io::Result<()> {
-        let last_saves_path = Self::default_data_dir().join("last_saves.csv");
-        let mut writer = csv::Writer::from_path(last_saves_path)?;
-        writer.write_record(&[
-            settings_path.to_str().unwrap(),
-            simulation_path.to_str().unwrap(),
-        ])?;
+        let mut writer = csv::Writer::from_path(last_saves_path())?;
+        writer.write_record(&[settings_path.to_str().unwrap(), simulation_path.to_str().unwrap()])?;
         writer.flush()?;
         Ok(())
     }
@@ -292,10 +270,10 @@ impl App {
                             self.esc();
                         }
                     }
-                    KeyCode::Char('f') => {
-                        let mut st = app_state_rc.borrow_mut();
-                        st.error_message = self.focus_stack.iter().map(|i| i.to_string()).collect();
-                    }
+                    // KeyCode::Char('f') => {
+                    //     let mut st = app_state_rc.borrow_mut();
+                    //     st.load_last_saves();
+                    // }
                     _ => (),
                 }
             }
@@ -767,6 +745,7 @@ impl Component for Button {
             if key.kind == KeyEventKind::Press && key.code == KeyCode::Enter {
                 if let Some(call_back) = &self.callback {
                     call_back(app_state);
+                    return Feedback::Esc;
                 }
             }
         }
@@ -785,17 +764,17 @@ impl Component for Button {
             !focus_stack.is_empty() && focus_stack[0] == focus_index && has_focused_parent;
         let color = {
             if is_focused {
-                Color::Black
+                Color::Yellow
             } else {
-                Color::Black
+                Color::White
             }
         };
         let container = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::White));
+            .border_style(Style::default().fg(color));
         frame.render_widget(&container, area);
         let inner_area = container.inner(area);
-        let inner = Block::default().style(Style::default().bg(color));
+        let inner = Block::default().style(Style::default().bg(Color::Black));
         frame.render_widget(&inner, inner_area);
     }
 }
@@ -1051,13 +1030,28 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                                                     },
                                                     {
                                                         let button = Button::new(|state| {
-
+                                                            if let Err(e) = state.borrow().save_current_settings() {
+                                                                state.borrow_mut().error_message = format!("Ошибка сохранения: {}", e);
+                                                            } else {
+                                                                state.borrow_mut().error_message = "Настройки сохранены".to_string();
+                                                            }
                                                         });
                                                         Box::new(button)
                                                     },
                                                     {
                                                         let button = Button::new(|state| {
-                                                            
+                                                            if let Some(path) = rfd::FileDialog::new()
+                                                                .set_title("Выберите файл с настройками клавиш")
+                                                                .add_filter("CSV", &["csv"])
+                                                                .pick_file()
+                                                            {
+                                                                let mut st = state.borrow_mut();
+                                                                if let Err(e) = st.import_settings_from_file(path) {
+                                                                    st.error_message = format!("Ошибка импорта: {}", e);
+                                                                } else {
+                                                                    st.error_message = "Настройки импортированы".to_string();
+                                                                }
+                                                            }
                                                         });
                                                         Box::new(button)
                                                     },
@@ -1069,7 +1063,7 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
                                                                 .save_file()
                                                             {
                                                                 let _ = state.borrow().save_settings_to_file(&path);
-                                                                let sim_path = AppState::default_simulation_path(); 
+                                                                let sim_path = default_simulation_path(); 
                                                                 let _ = AppState::update_last_saves(&path, &sim_path);
                                                                 state.borrow_mut().error_message = format!("Сохранено в {}", path.display());
                                                             }
@@ -1184,69 +1178,27 @@ fn app(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
     }
     Ok(())
 }
-
 fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.render(frame, area);
 }
-
-// struct Button {
-//     callback: Option<Rc<dyn Fn(Rc<RefCell<AppState>>)>>
-// }
-// let save_button = Button {
-//     callback: Some(Rc::new(|state: Rc<RefCell<AppState>>| {
-//         // Логика сохранения
-//         let mut s = state.borrow_mut();
-//         s.error_message = "Настройки сохранены!".to_string();
-//     }))
-// };
-// Box::new(save_button)
 fn canonical_key_name(key: KeyCode, app_state: &Rc<RefCell<AppState>>) -> String {
     match key {
         KeyCode::Char(c) => {
             let latin_upper = match c {
                 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё' => match c.to_ascii_lowercase() {
-                    'й' => "Q",
-                    'ц' => "W",
-                    'у' => "E",
-                    'к' => "R",
-                    'е' => "T",
-                    'н' => "Y",
-                    'г' => "U",
-                    'ш' => "I",
-                    'щ' => "O",
-                    'з' => "P",
-                    'х' => "{",
-                    'ъ' => "}",
-                    'ф' => "A",
-                    'ы' => "S",
-                    'в' => "D",
-                    'а' => "F",
-                    'п' => "G",
-                    'р' => "H",
-                    'о' => "J",
-                    'л' => "K",
-                    'д' => "L",
-                    'ж' => ":",
-                    'э' => "\'",
-                    'я' => "Z",
-                    'ч' => "X",
-                    'с' => "C",
-                    'м' => "V",
-                    'и' => "B",
-                    'т' => "N",
-                    'ь' => "M",
-                    'б' => "<",
-                    'ю' => ">",
-                    '.' => "/",
-                    '\\' => "\\",
-                    ' ' => "Space",
-                    '_' => "-",
-                    '=' => "+",
+                    'й' => "Q", 'ц' => "W", 'у' => "E", 'к' => "R", 'е' => "T",
+                    'н' => "Y", 'г' => "U", 'ш' => "I", 'щ' => "O", 'з' => "P",
+                    'х' => "{", 'ъ' => "}", 'ф' => "A", 'ы' => "S", 'в' => "D",
+                    'а' => "F", 'п' => "G", 'р' => "H", 'о' => "J", 'л' => "K",
+                    'д' => "L", 'ж' => ":", 'э' => "\'", 'я' => "Z", 'ч' => "X",
+                    'с' => "C", 'м' => "V", 'и' => "B", 'т' => "N", 'ь' => "M",
+                    'б' => "<", 'ю' => ">", '.' => "/", '\\' => "\\", ' ' => "Space",
+                    '_' => "-", '=' => "+",
                     _ => &c.to_ascii_uppercase().to_string(),
                 },
                 '.' => "/",
-                    '\\' => "\\",
+                '\\' => "\\",
                 ' ' => "Space",
                 '_' => "-",
                 '=' => "+",
@@ -1273,4 +1225,64 @@ fn canonical_key_name(key: KeyCode, app_state: &Rc<RefCell<AppState>>) -> String
             "?".to_string()
         }
     }
+}
+fn default_saves_dir() -> PathBuf {
+    let exe_path = std::env::current_exe().unwrap_or(PathBuf::from("."));
+    let exe_dir = exe_path.parent().unwrap_or(&exe_path);
+    exe_dir.join("saves")
+}
+fn default_settings_dir() -> PathBuf {
+    default_saves_dir().join("settings")
+}
+fn default_simulation_dir() -> PathBuf {
+    default_saves_dir().join("simulations")
+}
+fn current_simulation_path() -> PathBuf {
+    let last_saves = last_saves_path();
+    let mut reader = csv::Reader::from_path(&last_saves).unwrap();
+    if let Ok(record) = reader.headers() {
+        PathBuf::from(&record[1])
+    } else {
+        default_simulation_path()
+    }
+}
+fn current_settings_path() -> PathBuf {
+    let last_saves = last_saves_path();
+    let mut reader = csv::Reader::from_path(&last_saves).unwrap();
+    if let Ok(record) = reader.headers() {
+        PathBuf::from(&record[0])
+    } else {
+        default_settings_path()
+    }
+}
+fn default_settings_path() -> PathBuf {
+    default_settings_dir().join("default_settings.csv")
+}
+fn default_simulation_path() -> PathBuf {
+    default_simulation_dir().join("default_simulation.csv")
+}
+fn last_saves_path() -> PathBuf {
+    default_saves_dir().join("last_saves.csv")
+}
+fn default_key_bindings() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    map.insert("pause".to_string(), "Space".to_string());
+    map.insert("right".to_string(), "Right".to_string());
+    map.insert("left".to_string(), "Left".to_string());
+    map.insert("up".to_string(), "Up".to_string());
+    map.insert("down".to_string(), "Down".to_string());
+    map.insert("zoom_in".to_string(), "+".to_string());
+    map.insert("zoom_out".to_string(), "-".to_string());
+    map.insert("speed_up".to_string(), "L".to_string());
+    map.insert("speed_down".to_string(), "J".to_string());
+    map.insert("step".to_string(), "T".to_string());
+    map.insert("to_settings".to_string(), "Esc".to_string());
+    map
+}
+fn default_simulation_settings() -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    map.insert("cells_to_alive".to_string(), 1);
+    map.insert("cells_to_birth".to_string(), 3);
+    map.insert("simulation_speed".to_string(), 1);
+    map
 }
